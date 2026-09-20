@@ -20,6 +20,7 @@
 #include "main.h"
 #include "fatfs.h"
 #include "user_diskio.h"
+#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -42,6 +43,8 @@ volatile DSTATUS sd_status;
 #define BUTTON_RELEASED                    0U
 #define BUTTON_PRESSED                     1U
 /* USER CODE BEGIN PM */
+#define AUDIO_READ_SIZE 4096
+#define DAC_BUFFER_SIZE 1024
 
 /* USER CODE END PM */
 
@@ -74,6 +77,7 @@ static void MX_TIM6_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/*
 static uint16_t read_u16_le(const BYTE *p)
 {
     return (uint16_t)p[0] |
@@ -87,6 +91,7 @@ static uint32_t read_u32_le(const BYTE *p)
            ((uint32_t)p[2] << 16) |
            ((uint32_t)p[3] << 24);
 }
+*/
 
 static void ITM_SendString(const char *str)
 {
@@ -117,6 +122,133 @@ static void ITM_SendUint32(uint32_t value)
     {
         ITM_SendChar(digits[--i]);
     }
+}
+
+static void SD_SetFastSPI(void)
+{
+    HAL_SPI_DeInit(&hspi2);
+
+    hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_8;
+
+    if (HAL_SPI_Init(&hspi2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+typedef struct
+{
+    uint16_t audio_format;
+    uint16_t num_channels;
+    uint32_t sample_rate;
+    uint32_t byte_rate;
+    uint16_t block_align;
+    uint16_t bits_per_sample;
+    uint32_t data_size;
+    uint32_t data_offset;
+} WAV_Info;
+
+static FRESULT WAV_ParseHeader(FIL *file, WAV_Info *wav)
+{
+    uint8_t header[44];
+    UINT bytes_read;
+
+    FRESULT result;
+
+    result = f_read(file, header, sizeof(header), &bytes_read);
+
+    if (result != FR_OK)
+    {
+        return result;
+    }
+
+    if (bytes_read != sizeof(header))
+    {
+        return FR_INT_ERR;
+    }
+
+    if (memcmp(&header[0], "RIFF", 4) != 0)
+    {
+        return FR_INT_ERR;
+    }
+
+    if (memcmp(&header[8], "WAVE", 4) != 0)
+    {
+        return FR_INT_ERR;
+    }
+
+    if (memcmp(&header[12], "fmt ", 4) != 0)
+    {
+        return FR_INT_ERR;
+    }
+
+    if (memcmp(&header[36], "data", 4) != 0)
+    {
+        return FR_INT_ERR;
+    }
+
+    wav->audio_format =
+        header[20] |
+        (header[21] << 8);
+
+    wav->num_channels =
+        header[22] |
+        (header[23] << 8);
+
+    wav->sample_rate =
+        header[24] |
+        (header[25] << 8) |
+        (header[26] << 16) |
+        (header[27] << 24);
+
+    wav->byte_rate =
+        header[28] |
+        (header[29] << 8) |
+        (header[30] << 16) |
+        (header[31] << 24);
+
+    wav->block_align =
+        header[32] |
+        (header[33] << 8);
+
+    wav->bits_per_sample =
+        header[34] |
+        (header[35] << 8);
+
+    wav->data_size =
+        header[40] |
+        (header[41] << 8) |
+        (header[42] << 16) |
+        (header[43] << 24);
+
+    wav->data_offset = 44;
+
+    return FR_OK;
+}
+
+uint8_t audio_read_buffer[AUDIO_READ_SIZE];
+uint16_t dac_buffer[DAC_BUFFER_SIZE];
+
+static uint32_t PCM_To_DAC(
+    const uint8_t *pcm,
+    uint32_t pcm_bytes,
+    uint16_t *dac_buffer)
+{
+    uint32_t num_frames = pcm_bytes / 4;
+
+    for (uint32_t i = 0; i < num_frames; i++)
+    {
+        int16_t left =
+            (int16_t)(
+                pcm[i * 4] |
+                (pcm[i * 4 + 1] << 8)
+            );
+
+        dac_buffer[i] =
+            ((int32_t)left + 32768) >> 4;
+    }
+
+    return num_frames;
 }
 /* USER CODE END 0 */
 
@@ -158,6 +290,11 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   sd_status = USER_initialize(0);
+
+  if (sd_status == 0)
+  {
+      SD_SetFastSPI();
+  }
 
   ITM_SendString("SD stage: ");
   ITM_SendUint32(sd_debug_stage);
@@ -318,68 +455,175 @@ int main(void)
   }
 
   FIL wav_file;
-  UINT bytes_read;
   ITM_SendString("\r\nOpening WAV...\r\n");
+
+  WAV_Info wav;
 
   result = f_open(&wav_file, "0:/BASS1.WAV", FA_READ);
 
-  ITM_SendString("f_open result: ");
-  ITM_SendUint32(result);
-  ITM_SendString("\r\n");
+  if (result == FR_OK)
+  {
+      ITM_SendString("WAV opened\n");
+
+      result = WAV_ParseHeader(&wav_file, &wav);
+
+      if (result == FR_OK)
+      {
+          ITM_SendString("WAV header parsed\n");
+
+          ITM_SendString("Sample rate: ");
+          ITM_SendUint32(wav.sample_rate);
+          ITM_SendString("\n");
+
+          ITM_SendString("Channels: ");
+          ITM_SendUint32(wav.num_channels);
+          ITM_SendString("\n");
+
+          ITM_SendString("Bits/sample: ");
+          ITM_SendUint32(wav.bits_per_sample);
+          ITM_SendString("\n");
+
+          ITM_SendString("Data size: ");
+          ITM_SendUint32(wav.data_size);
+          ITM_SendString("\n");
+      }
+  }
+
+  UINT bytes_read;
+
+  result = f_read(
+      &wav_file,
+      audio_read_buffer,
+      AUDIO_READ_SIZE,
+      &bytes_read
+  );
+  ITM_SendString("Read bytes: ");
+  ITM_SendUint32(bytes_read);
+  ITM_SendString("\n");
+
+  uint32_t dac_samples = PCM_To_DAC(
+	  audio_read_buffer,
+      bytes_read,
+      dac_buffer
+  );
+
+  ITM_SendString("DAC samples: ");
+  ITM_SendUint32(dac_samples);
+  ITM_SendChar('\n');
+
+  HAL_DAC_Start_DMA(
+      &hdac1,
+      DAC_CHANNEL_1,
+      (uint32_t *)dac_buffer,
+      DAC_BUFFER_SIZE,
+      DAC_ALIGN_12B_R
+  );
+
+  HAL_TIM_Base_Start(&htim6);
+
+  result = f_open(&wav_file, "0:/BASS1.WAV", FA_READ);
 
   if (result == FR_OK)
   {
-      result = f_read(&wav_file, buffer, 44, &bytes_read);
+      ITM_SendString("WAV opened\n");
 
-      if (result == FR_OK && bytes_read == 44)
+      f_lseek(&wav_file, 44 + 20000);
+
+      UINT bytes_read;
+
+      result = f_read(
+          &wav_file,
+          audio_read_buffer,
+          AUDIO_READ_SIZE,
+          &bytes_read
+      );
+
+      if (result == FR_OK)
       {
-          uint16_t audio_format;
-          uint16_t channels;
-          uint32_t sample_rate;
-          uint32_t byte_rate;
-          uint16_t block_align;
-          uint16_t bits_per_sample;
-          uint32_t data_size;
+          uint32_t dac_samples = PCM_To_DAC(
+              audio_read_buffer,
+              bytes_read,
+              dac_buffer
+          );
 
-          audio_format    = read_u16_le(&buffer[20]);
-          channels        = read_u16_le(&buffer[22]);
-          sample_rate     = read_u32_le(&buffer[24]);
-          byte_rate       = read_u32_le(&buffer[28]);
-          block_align     = read_u16_le(&buffer[32]);
-          bits_per_sample = read_u16_le(&buffer[34]);
-          data_size       = read_u32_le(&buffer[40]);
+          ITM_SendString("DAC samples: ");
+          ITM_SendUint32(dac_samples);
+          ITM_SendChar('\n');
 
-          ITM_SendString("Audio Format: ");
-          ITM_SendUint32(audio_format);
-          ITM_SendString("\r\n");
+          HAL_DAC_Start_DMA(
+              &hdac1,
+              DAC_CHANNEL_1,
+              (uint32_t *)dac_buffer,
+              dac_samples,
+              DAC_ALIGN_12B_R
+          );
 
-          ITM_SendString("Channels: ");
-          ITM_SendUint32(channels);
-          ITM_SendString("\r\n");
+          HAL_TIM_Base_Start(&htim6);
+      }
+  }
+  /*
+  ITM_SendString("First 128 PCM bytes:\n");
 
-          ITM_SendString("Sample Rate: ");
-          ITM_SendUint32(sample_rate);
-          ITM_SendString(" Hz\r\n");
+  for (int i = 0; i < 128; i++)
+  {
+      ITM_SendUint32(audio_read_buffer[i]);
+      ITM_SendChar(' ');
+  }
 
-          ITM_SendString("Byte Rate: ");
-          ITM_SendUint32(byte_rate);
-          ITM_SendString(" bytes/sec\r\n");
+  ITM_SendChar('\n');
 
-          ITM_SendString("Block Align: ");
-          ITM_SendUint32(block_align);
-          ITM_SendString(" bytes\r\n");
+  uint32_t total_read = 0;
+  uint32_t nonzero_bytes = 0;
 
-          ITM_SendString("Bits/Sample: ");
-          ITM_SendUint32(bits_per_sample);
-          ITM_SendString(" bits\r\n");
+  while (total_read < wav.data_size)
+  {
+      uint32_t remaining = wav.data_size - total_read;
 
-          ITM_SendString("Data Size: ");
-          ITM_SendUint32(data_size);
-          ITM_SendString(" bytes\r\n");
+      UINT bytes_to_read =
+          (remaining < AUDIO_READ_SIZE)
+          ? remaining
+          : AUDIO_READ_SIZE;
+
+      UINT bytes_read = 0;
+
+      FRESULT result = f_read(
+          &wav_file,
+          audio_read_buffer,
+          bytes_to_read,
+          &bytes_read
+      );
+
+      if (result != FR_OK)
+      {
+          ITM_SendString("WAV read error\n");
+          break;
       }
 
-      f_close(&wav_file);
+      if (bytes_read == 0)
+      {
+          break;
+      }
+
+      for (UINT i = 0; i < bytes_read; i++)
+      {
+          if (audio_read_buffer[i] != 0)
+          {
+              nonzero_bytes++;
+          }
+      }
+
+      total_read += bytes_read;
   }
+
+  ITM_SendString("Total PCM bytes read: ");
+  ITM_SendUint32(total_read);
+  ITM_SendString("\n");
+
+  ITM_SendString("Nonzero bytes: ");
+  ITM_SendUint32(nonzero_bytes);
+  ITM_SendString("\n");
+  */
+
 
 
   /* USER CODE END 2 */
