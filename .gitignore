@@ -1,0 +1,25 @@
+# Build output
+Debug/
+Release/
+
+# STM32CubeIDE
+.settings/
+.metadata/
+*.launch
+
+# Generated binaries
+*.elf
+*.hex
+*.bin
+*.map
+
+# Object files
+*.o
+*.d
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# VS Code
+.vscode/
